@@ -5993,12 +5993,8 @@ function setBtnTxt(id, text) {
     // ── Grupos ──
     "groups": {
       "$groupId": {
-        ".read":  "auth != null && data.child('members').child(root.child('uids').child(auth.uid).val()).exists()",
-        ".write": "auth != null && (
-          !data.exists() ||
-          data.child('owner').val() === root.child('uids').child(auth.uid).val() ||
-          data.child('members').child(root.child('uids').child(auth.uid).val()).exists()
-        )"
+        ".read":  "auth != null",
+        ".write": "auth != null && (!data.exists() || data.child('owner').val() === root.child('uids').child(auth.uid).val() || data.child('members').child(root.child('uids').child(auth.uid).val()).exists())"
       }
     },
     // ── Chat de grupo ──
@@ -6975,6 +6971,8 @@ async function createGroup(name) {
     members: { [CU.username]: true },
     createdAt: Date.now()
   });
+  // Personal index — lets user query their own groups without reading all /groups
+  if (CU.uid) await fbSet('users/' + CU.uid + '/groups/' + id, true);
   toast('✓', 'Grupo "' + name.trim() + '" criado!');
   _renderingSocial = false;
   renderSocialPanel();
@@ -6982,10 +6980,25 @@ async function createGroup(name) {
 
 async function getMyGroups() {
   if (!_fbReady) return [];
-  // Find all groups where I'm a member
-  const snap = await fbGet('groups');
-  if (!snap) return [];
-  return Object.values(snap).filter(g => g && g.members && g.members[CU.username]);
+  try {
+    // Strategy 1: use personal index (uid-based, works with strict rules)
+    if (CU.uid) {
+      const index = await fbGet('users/' + CU.uid + '/groups');
+      if (index) {
+        const groupIds = Object.keys(index);
+        const groups = await Promise.all(
+          groupIds.map(gid => fbGet('groups/' + gid).catch(() => null))
+        );
+        return groups.filter(g => g && g.members && g.members[CU.username]);
+      }
+    }
+    // Strategy 2: fallback — read all groups (works if rules allow it)
+    const snap = await fbGet('groups');
+    if (!snap) return [];
+    return Object.values(snap).filter(g => g && g.members && g.members[CU.username]);
+  } catch {
+    return [];
+  }
 }
 
 async function renderGroupsTab(body) {
@@ -7198,6 +7211,8 @@ function showGroupInviteNotif(item) {
   el.querySelector('.ws-invite-accept').addEventListener('click', async e => {
     e.stopPropagation();
     await fbSet('groups/' + item.groupId + '/members/' + CU.username, true);
+    // Add to personal group index
+    if (CU.uid) await fbSet('users/' + CU.uid + '/groups/' + item.groupId, true);
     toast('✓', 'Você entrou no grupo "' + item.groupName + '"!');
     dismiss();
     _renderingSocial = false; renderSocialPanel();
