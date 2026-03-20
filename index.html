@@ -4069,6 +4069,9 @@ function stackNotes(dragN, targetN) {
   });
 
   saveNotes();
+  // Sync stack to group/shared workspace in real-time
+  if (_activeGroupWs) members.forEach(n => saveGroupNote(n));
+  else if (_activeWs)  members.forEach(n => saveSharedNote(n));
   renderStack(stackId);
 }
 
@@ -7572,6 +7575,16 @@ function initSocialListeners() {
       showGroupInviteNotif(item);
     } else if (item.type === 'group_ws_invite') {
       showGroupWsInviteNotif(item);
+    } else if (item.type === 'group_kick') {
+      // Kicked from group — leave workspace if active, refresh panel
+      if (_activeGroupWs?.groupId === item.groupId) {
+        leaveGroupWorkspace(false);
+        toast('⚡', 'Você foi removido do grupo "' + (item.groupName||'') + '" por @' + item.from + '.');
+      } else {
+        toast('⚡', 'Você foi removido do grupo "' + (item.groupName||'') + '".');
+      }
+      _renderingSocial = false;
+      renderSocialPanel();
     }
   });
 
@@ -8228,19 +8241,68 @@ async function renderGroupsTab(body) {
       }
       const memberList = document.createElement('div');
       memberList.className = 'sp-group-members';
-      memberList.style.cssText = 'padding:4px 12px 8px 56px;display:flex;flex-wrap:wrap;gap:6px;';
+      memberList.style.cssText = 'padding:4px 12px 8px 56px;display:flex;flex-direction:column;gap:4px;';
+      const isOwner = group.owner === CU.username;
       members.forEach((m, i) => {
         const p = presences[i];
         const color = p?.online ? ({ online:'#10b981', working:'#f59e0b', busy:'#ef4444' }[p.status] || '#10b981') : '#374151';
-        const span = document.createElement('span');
-        span.style.cssText = 'font-size:.68rem;color:rgba(240,240,240,.5);display:flex;align-items:center;gap:3px;';
-        span.innerHTML = `<span class="group-member-dot" style="background:${color}"></span>${xe(m)}`;
+        const span = document.createElement('div');
+        span.style.cssText = 'font-size:.68rem;color:rgba(240,240,240,.5);display:flex;align-items:center;gap:6px;';
+        const isGroupOwner = m === group.owner;
+        span.innerHTML = `
+          <span class="group-member-dot" style="background:${color}"></span>
+          <span style="flex:1;">${xe(m)}${isGroupOwner ? ' <span style="font-size:.58rem;color:rgba(99,102,241,.7);background:rgba(99,102,241,.12);padding:1px 5px;border-radius:4px;">dono</span>' : ''}</span>
+        `;
+        // Kick button — only for owner, not self, not other owners
+        if (isOwner && m !== CU.username && !isGroupOwner) {
+          const kickBtn = document.createElement('button');
+          kickBtn.textContent = '⚡ Kickar';
+          kickBtn.style.cssText = 'font-size:.6rem;padding:2px 7px;background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.25);border-radius:6px;color:#fca5a5;cursor:pointer;white-space:nowrap;';
+          kickBtn.addEventListener('click', async e2 => {
+            e2.stopPropagation();
+            kickBtn.disabled = true; kickBtn.textContent = '…';
+            await kickGroupMember(group, m);
+            span.remove();
+          });
+          span.appendChild(kickBtn);
+        }
         memberList.appendChild(span);
       });
       row.after(memberList);
     });
 
     body.appendChild(row);
+  }
+}
+
+// ── Kick member from group ──
+async function kickGroupMember(group, targetUser) {
+  if (!_fbReady || !CU) return;
+  if (group.owner !== CU.username) { toast('⚠', 'Apenas o dono pode kickar membros.'); return; }
+  if (targetUser === CU.username)  { toast('⚠', 'Você não pode se kickar.'); return; }
+
+  try {
+    // Remove from group members
+    await fbRemove('groups/' + group.id + '/members/' + targetUser);
+    // Remove from user's group index (uid-based)
+    const uid = await fbGet('usernames/' + targetUser).catch(() => null);
+    if (uid) await fbRemove('users/' + uid + '/groups/' + group.id).catch(() => {});
+
+    // Notify kicked user via groupInbox
+    await fbPush('groupInbox/' + targetUser, {
+      type: 'group_kick',
+      groupId: group.id,
+      groupName: group.name,
+      from: CU.username,
+      ts: Date.now()
+    });
+
+    toast('⚡', '@' + targetUser + ' foi removido do grupo.');
+    _renderingSocial = false;
+    renderSocialPanel();
+  } catch(e) {
+    console.error('kickGroupMember error:', e);
+    toast('⚠', 'Erro ao kickar usuário.');
   }
 }
 
@@ -8798,21 +8860,35 @@ async function loadGroupBoardNotes(groupId, isNew = false) {
   if (isNew) {
     // First creation — wipe Firebase so workspace starts empty
     await fbRemove('group_boards/' + groupId + '/notes');
+    await fbRemove('group_boards/' + groupId + '/files');
     syncCount();
     return;
   }
-  // Re-entry — load existing notes from Firebase
-  const snap = await fbGet('group_boards/' + groupId + '/notes');
-  if (!snap) { syncCount(); return; }
-  Object.values(snap).forEach(r => {
+  // Re-entry — load existing notes + files from Firebase
+  const [notesSnap, filesSnap] = await Promise.all([
+    fbGet('group_boards/' + groupId + '/notes'),
+    fbGet('group_boards/' + groupId + '/files'),
+  ]);
+  if (!notesSnap) { syncCount(); return; }
+  const allFiles = filesSnap || {};
+  Object.values(notesSnap).forEach(r => {
     if (!r?.id || !_activeGroupWs || notes.find(n => n.id === r.id)) return;
+    // Load files from /files/{noteId}
+    const noteFilesData = allFiles[r.id] || allFiles[String(r.id)] || {};
+    const noteFiles = Object.values(noteFilesData)
+      .sort((a,b) => (a.ts||0)-(b.ts||0))
+      .map(f => ({ id:f.id, name:f.name, size:f.size, type:f.type, dataUrl:f.dataUrl }));
     const n = { id:r.id, color:r.color||'indigo', title:r.title||'', body:r.body||'',
       start:r.start||'', end:r.end||'', reminder:false, remDays:3,
       status:r.status||'todo', titleH:r.titleH||0, bodyH:r.bodyH||0,
-      x:r.x||100, y:r.y||120, z:r.z||++zTop, files:r.files||[] };
+      x:r.x||100, y:r.y||120, z:r.z||++zTop, files:noteFiles,
+      stackId:r.stackId||null, stackOrder:r.stackOrder||0 };
     if (n.z > zTop) zTop = n.z;
     notes.push(n); mountNote(n);
   });
+  // Render stacks
+  const stackIds = [...new Set(notes.filter(n => n.stackId).map(n => n.stackId))];
+  setTimeout(() => stackIds.forEach(sid => renderStack(sid)), 0);
   syncCount();
 }
 
@@ -8833,9 +8909,13 @@ function listenGroupBoardNotes(groupId) {
     const n = { id:data.id, color:data.color||'indigo', title:data.title||'', body:data.body||'',
       start:data.start||'', end:data.end||'', reminder:false, remDays:3,
       status:data.status||'todo', titleH:data.titleH||0, bodyH:data.bodyH||0,
-      x:data.x||100, y:data.y||120, z:data.z||++zTop, files:data.files||[] };
+      x:data.x||100, y:data.y||120, z:data.z||++zTop, files:[],
+      stackId:data.stackId||null, stackOrder:data.stackOrder||0 };
     if (n.z > zTop) zTop = n.z;
-    notes.push(n); mountNote(n); syncCount();
+    notes.push(n); mountNote(n);
+    // Render stack if this note belongs to one
+    if (n.stackId) setTimeout(() => renderStack(n.stackId), 50);
+    syncCount();
   });
 
   r.on('child_removed', snap => {
@@ -8861,13 +8941,22 @@ function listenGroupBoardNotes(groupId) {
     if (ta1 && document.activeElement !== ta1) { n.title = data.title||''; ta1.value = n.title; }
     if (ta2 && document.activeElement !== ta2) { n.body  = data.body ||''; ta2.value = n.body;  }
     if (data.status !== undefined) { n.status = data.status; applyNoteStatus(el, data.status); }
-    // Files are in separate /files path — not synced here
-    if (data.x !== undefined && document.activeElement !== el) {
-      n.x = data.x; n.y = data.y;
-      el.style.left = data.x + 'px'; el.style.top = data.y + 'px';
-    }
-    if (data.z !== undefined && data.z > n.z) {
-      n.z = data.z; el.style.zIndex = data.z;
+    // Sync position
+    if (data.x !== undefined) { n.x = data.x; n.y = data.y; el.style.left = data.x+'px'; el.style.top = data.y+'px'; }
+    if (data.z !== undefined && data.z > n.z) { n.z = data.z; el.style.zIndex = data.z; }
+    // Sync stack membership in real-time
+    const prevStack = n.stackId;
+    if (data.stackId !== prevStack) {
+      n.stackId    = data.stackId || null;
+      n.stackOrder = data.stackOrder || 0;
+      if (prevStack) {
+        const rem = getStackNotes(prevStack);
+        document.querySelector('.stack-wrap[data-stack="'+prevStack+'"]')?.remove();
+        if (rem.length >= 2) setTimeout(() => renderStack(prevStack), 60);
+        else if (rem.length === 1) { rem[0].stackId = null; const re = document.querySelector('.note[data-id="'+rem[0].id+'"]'); if (re) { re.style.display=''; } }
+      }
+      if (n.stackId) setTimeout(() => renderStack(n.stackId), 80);
+      else { el.style.display=''; }
     }
   });
 
@@ -8875,17 +8964,20 @@ function listenGroupBoardNotes(groupId) {
   const filesRef = _db.ref('group_boards/' + groupId + '/files');
   if (_activeGroupWs) _activeGroupWs.filesRef = filesRef;
 
-  const syncFilesForNote = (noteId, filesData) => {
-    const n = notes.find(n => n.id === noteId); if (!n) return;
+  const syncFilesForNote = (noteKey, filesData) => {
+    // Note IDs can be numbers (Date.now()) — compare both ways
+    const noteId = parseInt(noteKey) || noteKey;
+    const n = notes.find(n => n.id === noteId || n.id === noteKey || String(n.id) === String(noteKey));
+    if (!n) return;
     n.files = Object.values(filesData || {})
       .sort((a,b) => (a.ts||0)-(b.ts||0))
       .map(f => ({ id:f.id, name:f.name, size:f.size, type:f.type, dataUrl:f.dataUrl }));
     renderFiles(n);
   };
 
-  filesRef.on('child_added',   snap => { if (_activeGroupWs?.groupId === groupId) syncFilesForNote(parseInt(snap.key), snap.val()); });
-  filesRef.on('child_changed', snap => { if (_activeGroupWs?.groupId === groupId) syncFilesForNote(parseInt(snap.key), snap.val()); });
-  filesRef.on('child_removed', snap => { if (_activeGroupWs?.groupId === groupId) syncFilesForNote(parseInt(snap.key), {}); });
+  filesRef.on('child_added',   snap => { if (_activeGroupWs?.groupId === groupId) syncFilesForNote(snap.key, snap.val()); });
+  filesRef.on('child_changed', snap => { if (_activeGroupWs?.groupId === groupId) syncFilesForNote(snap.key, snap.val()); });
+  filesRef.on('child_removed', snap => { if (_activeGroupWs?.groupId === groupId) syncFilesForNote(snap.key, {}); });
 
   // ── Status listener — workspace terminated by owner ──
   const statusRef = _db.ref('group_boards/' + groupId + '/status');
@@ -8913,11 +9005,12 @@ function listenGroupBoardNotes(groupId) {
 
 function saveGroupNote(n) {
   if (!_activeGroupWs || !_fbReady) return;
-  // Save note WITHOUT files — files are in a separate path to avoid overwrite conflicts
+  // Files are in /files path — not stored here to avoid overwrite conflicts
   fbSet('group_boards/' + _activeGroupWs.groupId + '/notes/' + n.id, {
     id:n.id, color:n.color, title:n.title, body:n.body,
     start:n.start||'', end:n.end||'', status:n.status||'todo',
-    titleH:n.titleH||0, bodyH:n.bodyH||0, x:n.x, y:n.y, z:n.z
+    titleH:n.titleH||0, bodyH:n.bodyH||0, x:n.x, y:n.y, z:n.z,
+    stackId:n.stackId||null, stackOrder:n.stackOrder||0
   });
 }
 
